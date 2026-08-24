@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AudioLink</title>
+<style>
+html,body{margin:0;width:100%;height:100%;background:#08080b;color:#fff;font-family:system-ui,sans-serif}
+body{display:grid;place-items:center}
+#app{width:min(620px,92vw);padding:24px;border:1px solid #25252d;border-radius:20px;background:#111116}
+h1{margin:0 0 8px}p{color:#aaa}
+button,input{width:100%;padding:13px;margin-top:10px;border-radius:11px;border:1px solid #292932;background:#09090d;color:#fff;font-size:15px}
+button{background:#fff;color:#111;font-weight:700}
+button:disabled{opacity:.45}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+#viewer{display:none;text-align:center}
+#listen{display:none}
+#bar{height:6px;background:#292932;border-radius:9px;margin-top:14px;overflow:hidden}
+#level{height:100%;width:0;background:#fff}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <section id="host">
+    <h1>🎙️ AudioLink</h1>
+    <p>WebRTC audio-only streaming.</p>
+    <div class="row">
+      <button id="start">Start microphone</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+    <input id="share" readonly placeholder="Generated viewer link">
+    <button id="copy" disabled>Copy viewer link</button>
+    <p id="status">Ready.</p>
+    <div id="bar"><div id="level"></div></div>
+  </section>
+
+  <section id="viewer">
+    <h1>🎧 AudioLink</h1>
+    <p id="viewerStatus">Connecting…</p>
+    <button id="listen">Tap to listen</button>
+    <audio id="audio" playsinline></audio>
+  </section>
+</div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+const room = params.get("room");
+
+const host = document.getElementById("host");
+const viewer = document.getElementById("viewer");
+const audio = document.getElementById("audio");
+const listen = document.getElementById("listen");
+const viewerStatus = document.getElementById("viewerStatus");
+
+let peer, mic, audioContext, animation;
+
+function processedAudio(input) {
+  audioContext = new AudioContext();
+
+  const src = audioContext.createMediaStreamSource(input);
+
+  // Voice isolation / cleanup
+  const highpass = audioContext.createBiquadFilter();
+  highpass.type = "highpass";
+  highpass.frequency.value = 70;
+
+  const lowshelf = audioContext.createBiquadFilter();
+  lowshelf.type = "lowshelf";
+  lowshelf.frequency.value = 180;
+  lowshelf.gain.value = 3;
+
+  const lowpass = audioContext.createBiquadFilter();
+  lowpass.type = "lowpass";
+  lowpass.frequency.value = 11000;
+
+  // Auto-level / voice compression
+  const compressor = audioContext.createDynamicsCompressor();
+  compressor.threshold.value = -24;
+  compressor.knee.value = 18;
+  compressor.ratio.value = 3;
+  compressor.attack.value = .006;
+  compressor.release.value = .15;
+
+  const destination = audioContext.createMediaStreamDestination();
+
+  src
+    .connect(highpass)
+    .connect(lowshelf)
+    .connect(lowpass)
+    .connect(compressor)
+    .connect(destination);
+
+  return destination.stream;
+}
+
+async function startHost() {
+  try {
+    document.getElementById("status").textContent = "Requesting microphone…";
+
+    mic = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1
+      },
+      video: false
+    });
+
+    const processed = processedAudio(mic);
+    await audioContext.resume();
+
+    peer = new Peer();
+
+    peer.on("open", id => {
+      const url = new URL(location.href);
+      url.search = "";
+      url.searchParams.set("room", id);
+
+      document.getElementById("share").value = url.href;
+      document.getElementById("copy").disabled = false;
+      document.getElementById("status").textContent =
+        "🟢 Live — share the viewer link.";
+    });
+
+    // IMPORTANT:
+    // The viewer calls this host. The host answers with the processed audio.
+    peer.on("call", incomingCall => {
+      incomingCall.answer(processed);
+
+      incomingCall.on("close", () => {
+        document.getElementById("status").textContent =
+          "Viewer disconnected.";
+      });
+    });
+
+    peer.on("error", e => {
+      document.getElementById("status").textContent =
+        "WebRTC error: " + e.type;
+    });
+
+    document.getElementById("start").disabled = true;
+    document.getElementById("stop").disabled = false;
+
+  } catch (e) {
+    document.getElementById("status").textContent =
+      "Microphone error: " + e.message;
+  }
+}
+
+function stopHost() {
+  mic?.getTracks().forEach(t => t.stop());
+  peer?.destroy();
+  audioContext?.close();
+
+  document.getElementById("start").disabled = false;
+  document.getElementById("stop").disabled = true;
+  document.getElementById("copy").disabled = true;
+  document.getElementById("share").value = "";
+  document.getElementById("status").textContent = "Stopped.";
+}
+
+async function connectViewer(id) {
+  host.style.display = "none";
+  viewer.style.display = "block";
+
+  const viewerPeer = new Peer();
+
+  viewerPeer.on("open", () => {
+    /*
+      IMPORTANT:
+      We create a silent local audio stream because PeerJS expects
+      a MediaStream for the outgoing call. The host returns its real
+      processed microphone stream.
+    */
+    const silentContext = new AudioContext();
+    const silentDestination =
+      silentContext.createMediaStreamDestination();
+
+    const call = viewerPeer.call(id, silentDestination.stream);
+
+    call.on("stream", remoteStream => {
+      audio.srcObject = remoteStream;
+
+      audio.play().then(() => {
+        viewerStatus.textContent = "🟢 Connected — audio playing.";
+      }).catch(() => {
+        viewerStatus.textContent = "Connected — tap below to hear.";
+        listen.style.display = "block";
+      });
+    });
+
+    call.on("close", () => {
+      viewerStatus.textContent = "Host disconnected.";
+    });
+
+    call.on("error", () => {
+      viewerStatus.textContent = "Connection failed.";
+    });
+  });
+
+  viewerPeer.on("error", () => {
+    viewerStatus.textContent = "Unable to connect.";
+  });
+}
+
+listen.onclick = async () => {
+  try {
+    await audio.play();
+    listen.style.display = "none";
+    viewerStatus.textContent = "🟢 Audio playing.";
+  } catch(e) {
+    viewerStatus.textContent = "Browser still blocked audio.";
+  }
+};
+
+document.getElementById("start").onclick = startHost;
+document.getElementById("stop").onclick = stopHost;
+
+document.getElementById("copy").onclick = async () => {
+  const input = document.getElementById("share");
+  await navigator.clipboard.writeText(input.value);
+  document.getElementById("copy").textContent = "Copied ✓";
+  setTimeout(() => {
+    document.getElementById("copy").textContent = "Copy viewer link";
+  }, 1200);
+};
+
+if (room) {
+  connectViewer(room);
+}
+</script>
+</body>
+</html>
